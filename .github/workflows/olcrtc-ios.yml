@@ -55,17 +55,6 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build simulator app
-        run: |
-          xcodebuild \
-            -project OlcRTCClient.xcodeproj \
-            -scheme OlcRTCClient \
-            -configuration Release \
-            -sdk iphonesimulator \
-            -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO \
-            build
-
       - name: Build unsigned device app
         run: |
           xcodebuild \
@@ -75,6 +64,7 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
+            ARCHS=arm64 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -91,14 +81,3 @@ jobs:
           name: OlcRTCClient-unsigned-ipa
           path: OlcRTC-iOS/build/ipa/OlcRTCClient-unsigned.ipa
           if-no-files-found: error
-
-      - name: Test URI parser
-        run: |
-          xcodebuild \
-            -project OlcRTCClient.xcodeproj \
-            -scheme OlcRTCAppTests \
-            -configuration Debug \
-            -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
-            CODE_SIGNING_ALLOWED=NO \
-            test

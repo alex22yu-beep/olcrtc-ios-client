@@ -36,6 +36,7 @@ targets:
     dependencies:
       - framework: Frameworks/Mobile.xcframework
         embed: true
+      - sdk: libresolv.tbd
       - target: OlcRTCPacketTunnel
         embed: true
     settings:
@@ -60,8 +61,7 @@ targets:
     dependencies:
       - framework: Frameworks/Mobile.xcframework
         embed: true
-      - framework: Frameworks/Libbox.xcframework
-        embed: true
+      - sdk: libresolv.tbd
       - package: Tun2SocksKit
     settings:
       base:

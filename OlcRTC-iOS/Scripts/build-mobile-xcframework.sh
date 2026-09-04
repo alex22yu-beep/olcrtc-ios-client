@@ -22,7 +22,7 @@ fi
 pushd "$OLCRTC_DIR" >/dev/null
 echo "Using olcRTC $(git rev-parse --short HEAD) from $OLCRTC_REF"
 echo "Patches skipped — master already contains all required features"
-gomobile bind -target=ios -o "$FRAMEWORK_DIR/Mobile.xcframework" ./mobile
+gomobile bind -target=ios/arm64 -iosversion=17.0 -o "$FRAMEWORK_DIR/Mobile.xcframework" ./mobile
 popd >/dev/null
 
 echo "Built $FRAMEWORK_DIR/Mobile.xcframework"
