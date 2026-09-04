@@ -21,7 +21,9 @@ enum OlcRTCEngine {
             throw RuntimeError.alreadyRunning
         }
 
-        let rt = MobileNew()
+        guard let rt = MobileNew() else {
+            throw RuntimeError.alreadyRunning
+        }
 
         do {
             try rt.setProvider(profile.carrier)
@@ -30,16 +32,16 @@ enum OlcRTCEngine {
             rt.setChannel(runtimeClientID ?? profile.clientID)
             try rt.setKey(profile.keyHex)
             try rt.setDNS("8.8.8.8:53")
-            try rt.setSocksPort(Int32(socksPort))
+            try rt.setSocksPort(socksPort)
             if !credentials.username.isEmpty || !credentials.password.isEmpty {
-                try rt.setSocksCredentials(credentials.username, credentials.password)
+                try rt.setSocksCredentials(credentials.username, password: credentials.password)
             }
-            try rt.setLivenessOptions(20_000, 15_000, 12)
+            try rt.setLivenessOptions(20_000, timeoutMillis: 15_000, failures: 12)
 
             configureTransportOptions(rt, profile)
 
             try rt.start()
-            try rt.waitReady(Int32(profile.startReadyTimeoutMilliseconds))
+            try rt.waitReady(profile.startReadyTimeoutMilliseconds)
         } catch {
             try? rt.stop(5_000)
             throw error
@@ -63,26 +65,26 @@ enum OlcRTCEngine {
         switch profile.transport {
         case "vp8channel":
             try? rt.setVP8Options(
-                Int32(profile.payloadInt("vp8-fps", default: 60)),
-                Int32(profile.payloadInt("vp8-batch", default: 64))
+                profile.payloadInt("vp8-fps", default: 60),
+                batchSize: profile.payloadInt("vp8-batch", default: 64)
             )
         case "seichannel":
             try? rt.setSEIOptions(
-                Int32(profile.payloadInt("fps", default: 30)),
-                Int32(profile.payloadInt("batch", default: 64)),
-                Int32(profile.payloadInt("frag", default: 1200)),
-                Int32(profile.payloadInt("ack-ms", default: 500))
+                profile.payloadInt("fps", default: 30),
+                batchSize: profile.payloadInt("batch", default: 64),
+                fragmentSize: profile.payloadInt("frag", default: 1200),
+                ackTimeoutMillis: profile.payloadInt("ack-ms", default: 500)
             )
         case "videochannel":
             try? rt.setVideoOptions(
-                Int32(profile.payloadInt("video-w", default: 0)),
-                Int32(profile.payloadInt("video-h", default: 0)),
-                Int32(profile.payloadInt("video-fps", default: 0)),
-                Int32(profile.payloadInt("video-qr-size", default: 0)),
-                profile.payload["video-qr-recovery"] ?? "",
-                profile.payload["video-codec"] ?? "",
-                Int32(profile.payloadInt("video-tile-module", default: 0)),
-                Int32(profile.payloadInt("video-tile-rs", default: 0))
+                profile.payloadInt("video-w", default: 0),
+                height: profile.payloadInt("video-h", default: 0),
+                fps: profile.payloadInt("video-fps", default: 0),
+                qrSize: profile.payloadInt("video-qr-size", default: 0),
+                qrRecovery: profile.payload["video-qr-recovery"] ?? "",
+                codec: profile.payload["video-codec"] ?? "",
+                tileModule: profile.payloadInt("video-tile-module", default: 0),
+                tileRS: profile.payloadInt("video-tile-rs", default: 0)
             )
         default:
             break

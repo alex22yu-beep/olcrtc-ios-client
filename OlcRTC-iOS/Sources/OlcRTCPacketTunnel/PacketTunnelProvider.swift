@@ -62,7 +62,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let routingPreset = RoutingPreset(rawValue: providerConfiguration["routingPreset"] as? String ?? "") ?? .simpleRU
 
         #if canImport(Mobile)
-        let rt = MobileNew()
+        guard let rt = MobileNew() else {
+            completionHandler(TunnelError.mobileFrameworkMissing)
+            return
+        }
 
         do {
             try rt.setProvider(carrier)
@@ -71,16 +74,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             rt.setChannel(clientID)
             try rt.setKey(keyHex)
             try rt.setDNS("8.8.8.8:53")
-            try rt.setSocksPort(Int32(socksPort))
+            try rt.setSocksPort(socksPort)
             if !socksUser.isEmpty || !socksPass.isEmpty {
-                try rt.setSocksCredentials(socksUser, socksPass)
+                try rt.setSocksCredentials(socksUser, password: socksPass)
             }
-            try rt.setLivenessOptions(Int32(20_000), Int32(15_000), Int32(12))
+            try rt.setLivenessOptions(20_000, timeoutMillis: 15_000, failures: 12)
 
             configureTransportOptions(rt, transport: transport, payload: payload)
 
             try rt.start()
-            try rt.waitReady(Int32(readyTimeoutMilliseconds(carrier: carrier, transport: transport)))
+            try rt.waitReady(readyTimeoutMilliseconds(carrier: carrier, transport: transport))
         } catch {
             completionHandler(error)
             return
@@ -220,26 +223,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch transport.lowercased() {
         case "vp8channel":
             try? rt.setVP8Options(
-                Int32(payloadInt(payload, "vp8-fps", default: 60)),
-                Int32(payloadInt(payload, "vp8-batch", default: 64))
+                payloadInt(payload, "vp8-fps", default: 60),
+                batchSize: payloadInt(payload, "vp8-batch", default: 64)
             )
         case "seichannel":
             try? rt.setSEIOptions(
-                Int32(payloadInt(payload, "fps", default: 30)),
-                Int32(payloadInt(payload, "batch", default: 64)),
-                Int32(payloadInt(payload, "frag", default: 1200)),
-                Int32(payloadInt(payload, "ack-ms", default: 500))
+                payloadInt(payload, "fps", default: 30),
+                batchSize: payloadInt(payload, "batch", default: 64),
+                fragmentSize: payloadInt(payload, "frag", default: 1200),
+                ackTimeoutMillis: payloadInt(payload, "ack-ms", default: 500)
             )
         case "videochannel":
             try? rt.setVideoOptions(
-                Int32(payloadInt(payload, "video-w", default: 0)),
-                Int32(payloadInt(payload, "video-h", default: 0)),
-                Int32(payloadInt(payload, "video-fps", default: 0)),
-                Int32(payloadInt(payload, "video-qr-size", default: 0)),
-                payload["video-qr-recovery"] ?? "",
-                payload["video-codec"] ?? "",
-                Int32(payloadInt(payload, "video-tile-module", default: 0)),
-                Int32(payloadInt(payload, "video-tile-rs", default: 0))
+                payloadInt(payload, "video-w", default: 0),
+                height: payloadInt(payload, "video-h", default: 0),
+                fps: payloadInt(payload, "video-fps", default: 0),
+                qrSize: payloadInt(payload, "video-qr-size", default: 0),
+                qrRecovery: payload["video-qr-recovery"] ?? "",
+                codec: payload["video-codec"] ?? "",
+                tileModule: payloadInt(payload, "video-tile-module", default: 0),
+                tileRS: payloadInt(payload, "video-tile-rs", default: 0)
             )
         default:
             break
