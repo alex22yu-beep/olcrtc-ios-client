@@ -6,6 +6,10 @@ import Mobile
 #endif
 
 enum OlcRTCEngine {
+    #if canImport(Mobile)
+    static var runtime: MobileRuntime?
+    #endif
+
     static func start(
         profile: OlcRTCProfile,
         socksPort: Int = 18080,
@@ -13,83 +17,78 @@ enum OlcRTCEngine {
         runtimeClientID: String? = nil
     ) throws {
         #if canImport(Mobile)
-        MobileSetProviders()
-        MobileSetDNS("8.8.8.8:53")
-        MobileSetTransport(profile.transport)
-        MobileSetLivenessOptions(20_000, 15_000, 12)
-        configureTransportOptions(profile)
-
-        var startError: NSError?
-        let started = MobileStartWithTransport(
-            profile.carrier,
-            profile.transport,
-            profile.roomID,
-            runtimeClientID ?? profile.clientID,
-            profile.keyHex,
-            socksPort,
-            credentials.username,
-            credentials.password,
-            &startError
-        )
-        if let startError {
-            throw startError
-        }
-        guard started else {
-            throw RuntimeError.startFailed
+        guard runtime == nil else {
+            throw RuntimeError.alreadyRunning
         }
 
-        var waitError: NSError?
-        let ready = MobileWaitReady(profile.startReadyTimeoutMilliseconds, &waitError)
-        if let waitError {
-            throw waitError
+        let rt = MobileNew()
+
+        do {
+            try rt.setProvider(profile.carrier)
+            try rt.setTransport(profile.transport)
+            try rt.setRoom(profile.roomID)
+            rt.setChannel(runtimeClientID ?? profile.clientID)
+            try rt.setKey(profile.keyHex)
+            try rt.setDNS("8.8.8.8:53")
+            try rt.setSocksPort(Int32(socksPort))
+            if !credentials.username.isEmpty || !credentials.password.isEmpty {
+                try rt.setSocksCredentials(credentials.username, credentials.password)
+            }
+            try rt.setLivenessOptions(20_000, 15_000, 12)
+
+            configureTransportOptions(rt, profile)
+
+            try rt.start()
+            try rt.waitReady(Int32(profile.startReadyTimeoutMilliseconds))
+        } catch {
+            try? rt.stop(5_000)
+            throw error
         }
-        guard ready else {
-            throw RuntimeError.readyTimeout
-        }
+
+        runtime = rt
         #else
         throw RuntimeError.frameworkMissing
         #endif
     }
 
-    private static func configureTransportOptions(_ profile: OlcRTCProfile) {
+    static func stop() {
         #if canImport(Mobile)
+        try? runtime?.stop(5_000)
+        runtime = nil
+        #endif
+    }
+
+    #if canImport(Mobile)
+    private static func configureTransportOptions(_ rt: MobileRuntime, _ profile: OlcRTCProfile) {
         switch profile.transport {
         case "vp8channel":
-            MobileSetVP8Options(
-                profile.payloadInt("vp8-fps", default: 60),
-                profile.payloadInt("vp8-batch", default: 64)
+            try? rt.setVP8Options(
+                Int32(profile.payloadInt("vp8-fps", default: 60)),
+                Int32(profile.payloadInt("vp8-batch", default: 64))
             )
         case "seichannel":
-            MobileSetSEIOptions(
-                profile.payloadInt("fps", default: 0),
-                profile.payloadInt("batch", default: 0),
-                profile.payloadInt("frag", default: 0),
-                profile.payloadInt("ack-ms", default: 0)
+            try? rt.setSEIOptions(
+                Int32(profile.payloadInt("fps", default: 30)),
+                Int32(profile.payloadInt("batch", default: 64)),
+                Int32(profile.payloadInt("frag", default: 900)),
+                Int32(profile.payloadInt("ack-ms", default: 2000))
             )
         case "videochannel":
-            MobileSetVideoOptions(
-                profile.payloadInt("video-w", default: 0),
-                profile.payloadInt("video-h", default: 0),
-                profile.payloadInt("video-fps", default: 0),
-                profile.payload["video-bitrate"] ?? "",
-                profile.payload["video-hw"] ?? "",
-                profile.payloadInt("video-qr-size", default: 0),
-                profile.payload["video-qr-recovery"] ?? "",
-                profile.payload["video-codec"] ?? "",
-                profile.payloadInt("video-tile-module", default: 0),
-                profile.payloadInt("video-tile-rs", default: 0)
+            try? rt.setVideoOptions(
+                Int32(profile.payloadInt("video-w", default: 1920)),
+                Int32(profile.payloadInt("video-h", default: 1080)),
+                Int32(profile.payloadInt("video-fps", default: 30)),
+                Int32(profile.payloadInt("video-qr-size", default: 0)),
+                profile.payload["video-qr-recovery"] ?? "low",
+                profile.payload["video-codec"] ?? "qrcode",
+                Int32(profile.payloadInt("video-tile-module", default: 4)),
+                Int32(profile.payloadInt("video-tile-rs", default: 0))
             )
         default:
             break
         }
-        #endif
     }
-
-    static func stop() {
-        #if canImport(Mobile)
-        MobileStop()
-        #endif
-    }
+    #endif
 
     static func checkLocalSocks(port: Int, credentials: SocksCredentials, timeoutNanoseconds: UInt64 = 5_000_000_000) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
@@ -101,9 +100,14 @@ enum OlcRTCEngine {
                 return false
             }
 
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
+            for await result in group {
+                if result {
+                    group.cancelAll()
+                    return true
+                }
+            }
+
+            return false
         }
     }
 
@@ -176,10 +180,10 @@ enum OlcRTCEngine {
             var address = sockaddr_in()
             address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET)
-            address.sin_port = in_port_t(port).bigEndian
+            address.sin_port = UInt16(port).bigEndian
             address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
-            let result = withUnsafePointer(to: &address) { pointer in
+            let connectResult = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
                     Darwin.connect(
                         descriptor,
@@ -189,7 +193,7 @@ enum OlcRTCEngine {
                 }
             }
 
-            guard result == 0 else {
+            guard connectResult == 0 else {
                 return false
             }
 
@@ -230,10 +234,10 @@ enum OlcRTCEngine {
             var address = sockaddr_in()
             address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
             address.sin_family = sa_family_t(AF_INET)
-            address.sin_port = in_port_t(port).bigEndian
+            address.sin_port = UInt16(port).bigEndian
             address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
-            let result = withUnsafePointer(to: &address) { pointer in
+            let connectResult = withUnsafePointer(to: &address) { pointer in
                 pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
                     Darwin.connect(
                         descriptor,
@@ -243,10 +247,11 @@ enum OlcRTCEngine {
                 }
             }
 
-            guard result == 0 else {
+            guard connectResult == 0 else {
                 return false
             }
 
+            // Auth
             guard Self.writeAll([0x05, 0x01, 0x02], to: descriptor),
                   Self.readExact(2, from: descriptor) == [0x05, 0x02] else {
                 return false
@@ -262,36 +267,39 @@ enum OlcRTCEngine {
                 return false
             }
 
-            guard let request = target.connectRequest,
-                  Self.writeAll(request, to: descriptor),
-                  let header = Self.readExact(4, from: descriptor),
-                  header.count == 4,
-                  header[0] == 0x05,
-                  header[1] == 0x00 else {
+            // CONNECT request
+            let targetIP = target.ip
+            var connectRequest: [UInt8] = [0x05, 0x01, 0x00, 0x01]
+            connectRequest.append(contentsOf: targetIP)
+            connectRequest.append(UInt8((target.port >> 8) & 0xFF))
+            connectRequest.append(UInt8(target.port & 0xFF))
+
+            guard Self.writeAll(connectRequest, to: descriptor) else {
                 return false
             }
 
-            let addressLength: Int
-            switch header[3] {
-            case 0x01:
-                addressLength = 4
-            case 0x03:
-                guard let lengthByte = Self.readExact(1, from: descriptor)?.first else {
-                    return false
-                }
-                addressLength = Int(lengthByte)
-            case 0x04:
-                addressLength = 16
-            default:
-                return false
-            }
-
-            return Self.readExact(addressLength + 2, from: descriptor) != nil
+            let response = Self.readExact(10, from: descriptor)
+            return response != nil && response![1] == 0x00
         }.value
     }
 
-    private static func setSocketTimeouts(_ descriptor: Int32, seconds: Int = 3) {
-        var timeout = timeval(tv_sec: seconds, tv_usec: 0)
+    private enum SocksConnectTarget {
+        case google
+
+        var ip: [UInt8] {
+            switch self {
+            case .google:
+                return [142, 250, 185, 206] // google.com
+            }
+        }
+
+        var port: Int {
+            443
+        }
+    }
+
+    private static func setSocketTimeouts(_ descriptor: Int32) {
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
         withUnsafePointer(to: &timeout) { pointer in
             _ = setsockopt(
                 descriptor,
@@ -351,69 +359,15 @@ enum OlcRTCEngine {
 
     enum RuntimeError: LocalizedError {
         case frameworkMissing
-        case startFailed
-        case readyTimeout
+        case alreadyRunning
 
         var errorDescription: String? {
             switch self {
             case .frameworkMissing:
                 return "Mobile.xcframework is not linked. Build it with Scripts/build-mobile-xcframework.sh."
-            case .startFailed:
-                return "olcrtc did not start."
-            case .readyTimeout:
-                return "olcrtc SOCKS proxy was not ready in time."
+            case .alreadyRunning:
+                return "olcRTC is already running."
             }
         }
-    }
-}
-
-private extension OlcRTCProfile {
-    func payloadInt(_ key: String, default defaultValue: Int) -> Int {
-        Int(payload[key] ?? "") ?? defaultValue
-    }
-}
-
-private struct SocksConnectTarget: Sendable {
-    enum Address: Sendable {
-        case ipv4(String)
-        case domain(String)
-    }
-
-    let address: Address
-    let port: UInt16
-
-    static let google = SocksConnectTarget(address: .domain("www.google.com"), port: 443)
-
-    static let defaults = [
-        google,
-        SocksConnectTarget(address: .ipv4("1.1.1.1"), port: 443),
-        SocksConnectTarget(address: .ipv4("8.8.8.8"), port: 443),
-        SocksConnectTarget(address: .domain("www.apple.com"), port: 443)
-    ]
-
-    var connectRequest: [UInt8]? {
-        var request: [UInt8] = [0x05, 0x01, 0x00]
-
-        switch address {
-        case let .ipv4(value):
-            let parts = value.split(separator: ".").compactMap { UInt8($0) }
-            guard parts.count == 4 else {
-                return nil
-            }
-            request.append(0x01)
-            request.append(contentsOf: parts)
-        case let .domain(value):
-            let host = Array(value.utf8)
-            guard !host.isEmpty, host.count <= 255 else {
-                return nil
-            }
-            request.append(0x03)
-            request.append(UInt8(host.count))
-            request.append(contentsOf: host)
-        }
-
-        request.append(UInt8(port >> 8))
-        request.append(UInt8(port & 0xff))
-        return request
     }
 }

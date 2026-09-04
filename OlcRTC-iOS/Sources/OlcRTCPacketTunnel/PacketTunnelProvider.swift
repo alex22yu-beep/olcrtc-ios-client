@@ -35,6 +35,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelStarted = false
     private var packetEngine: Tun2SocksPacketEngine?
 
+    #if canImport(Mobile)
+    private var runtime: MobileRuntime?
+    #endif
+
     override func startTunnel(
         options: [String: NSObject]?,
         completionHandler: @escaping (Error?) -> Void
@@ -58,61 +62,52 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let routingPreset = RoutingPreset(rawValue: providerConfiguration["routingPreset"] as? String ?? "") ?? .simpleRU
 
         #if canImport(Mobile)
-        MobileSetProviders()
-        MobileSetDNS("8.8.8.8:53")
-        MobileSetTransport(transport)
-        MobileSetLivenessOptions(20_000, 15_000, 12)
-        configureTransportOptions(transport: transport, payload: payload)
+        let rt = MobileNew()
 
-        var startError: NSError?
-        let started = MobileStartWithTransport(
-            carrier,
-            transport,
-            roomID,
-            clientID,
-            keyHex,
-            socksPort,
-            socksUser,
-            socksPass,
-            &startError
-        )
+        do {
+            try rt.setProvider(carrier)
+            try rt.setTransport(transport)
+            try rt.setRoom(roomID)
+            rt.setChannel(clientID)
+            try rt.setKey(keyHex)
+            try rt.setDNS("8.8.8.8:53")
+            try rt.setSocksPort(Int32(socksPort))
+            if !socksUser.isEmpty || !socksPass.isEmpty {
+                try rt.setSocksCredentials(socksUser, socksPass)
+            }
+            try rt.setLivenessOptions(20_000, 15_000, 12)
 
-        if let startError {
-            completionHandler(startError)
+            configureTransportOptions(rt, transport: transport, payload: payload)
+
+            try rt.start()
+            try rt.waitReady(Int32(readyTimeoutMilliseconds(carrier: carrier, transport: transport)))
+        } catch {
+            completionHandler(error)
             return
         }
 
-        guard started else {
-            completionHandler(TunnelError.olcrtcStartFailed)
-            return
-        }
-
-        var waitError: NSError?
-        let ready = MobileWaitReady(
-            readyTimeoutMilliseconds(carrier: carrier, transport: transport),
-            &waitError
-        )
-        if let waitError {
-            MobileStop()
-            completionHandler(waitError)
-            return
-        }
-        guard ready else {
-            MobileStop()
-            completionHandler(TunnelError.olcrtcReadyTimeout)
-            return
-        }
+        runtime = rt
+        #else
+        completionHandler(TunnelError.mobileFrameworkMissing)
+        return
+        #endif
 
         let settings = networkSettings(mode: tunnelMode, routingPreset: routingPreset, port: socksPort)
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self else {
-                MobileStop()
+                #if canImport(Mobile)
+                try? self?.runtime?.stop(5_000)
+                self?.runtime = nil
+                #endif
                 completionHandler(TunnelError.providerDeallocated)
                 return
             }
 
             if let error {
-                MobileStop()
+                #if canImport(Mobile)
+                try? self.runtime?.stop(5_000)
+                self.runtime = nil
+                #endif
                 completionHandler(error)
                 return
             }
@@ -127,7 +122,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     try engine.start()
                     self.packetEngine = engine
                 } catch {
-                    MobileStop()
+                    #if canImport(Mobile)
+                    try? self.runtime?.stop(5_000)
+                    self.runtime = nil
+                    #endif
                     completionHandler(error)
                     return
                 }
@@ -136,48 +134,102 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.tunnelStarted = true
             completionHandler(nil)
         }
-        #else
-        completionHandler(TunnelError.mobileFrameworkMissing)
-        #endif
     }
 
     override func stopTunnel(
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
     ) {
-        packetEngine?.stop()
-        packetEngine = nil
-
         #if canImport(Mobile)
-        if tunnelStarted {
-            MobileStop()
-        }
+        try? runtime?.stop(5_000)
+        runtime = nil
         #endif
         tunnelStarted = false
+        packetEngine?.stop()
+        packetEngine = nil
         completionHandler()
     }
 
+    // MARK: - Network Settings
+
     private func networkSettings(mode: TunnelMode, routingPreset: RoutingPreset, port: Int) -> NEPacketTunnelNetworkSettings {
-        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "10.88.0.1")
-        settings.mtu = 1280
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
+        settings.mtu = 1500
 
-        let ipv4 = NEIPv4Settings(addresses: ["10.88.0.2"], subnetMasks: ["255.255.255.0"])
-        if mode.usesPacketEngine {
-            ipv4.includedRoutes = [NEIPv4Route.default()]
-            if mode == .splitTunnel || routingPreset.shouldBypassLocalRoutes {
-                ipv4.excludedRoutes = Self.privateAndLocalRoutes()
+        switch mode {
+        case .systemProxy:
+            settings.proxySettings = proxySettings(port: port)
+
+        case .fullTunnel:
+            settings.ipv4Settings = ipv4Settings(routes: allTrafficRoutes())
+            settings.proxySettings = proxySettings(port: port)
+
+        case .splitTunnel:
+            let routes: [NEIPv4Route]
+            switch routingPreset {
+            case .allProxy:
+                routes = allTrafficRoutes()
+            case .simpleRU:
+                routes = ruRoutes()
+            case .blockedOnly:
+                routes = blockedRoutes()
+            case .localOnly:
+                routes = []
             }
-        }
-        settings.ipv4Settings = ipv4
-        settings.dnsSettings = NEDNSSettings(servers: ["8.8.8.8", "1.1.1.1"])
-
-        if mode == .systemProxy {
+            settings.ipv4Settings = ipv4Settings(routes: routes)
             settings.proxySettings = proxySettings(port: port)
         }
+
         return settings
     }
 
-    private static func privateAndLocalRoutes() -> [NEIPv4Route] {
+    private func ipv4Settings(routes: [NEIPv4Route]) -> NEIPv4Settings {
+        let settings = NEIPv4Settings(
+            addresses: ["198.18.0.1"],
+            subnetMasks: ["255.255.255.0"]
+        )
+        settings.includedRoutes = routes
+        return settings
+    }
+
+    private func allTrafficRoutes() -> [NEIPv4Route] {
+        [NEIPv4Route.default()]
+    }
+
+    private func ruRoutes() -> [NEIPv4Route] {
+        // Common Russian IP ranges (simplified)
+        [
+            route("5.3.0.0", "255.255.0.0"),
+            route("5.128.0.0", "255.192.0.0"),
+            route("31.128.0.0", "255.192.0.0"),
+            route("37.29.0.0", "255.255.0.0"),
+            route("46.39.0.0", "255.255.0.0"),
+            route("77.34.0.0", "255.254.0.0"),
+            route("78.106.0.0", "255.254.0.0"),
+            route("79.164.0.0", "255.252.0.0"),
+            route("80.64.0.0", "255.240.0.0"),
+            route("83.149.0.0", "255.255.0.0"),
+            route("85.26.0.0", "255.254.0.0"),
+            route("89.16.0.0", "255.248.0.0"),
+            route("91.76.0.0", "255.252.0.0"),
+            route("93.80.0.0", "255.240.0.0"),
+            route("95.24.0.0", "255.248.0.0"),
+            route("109.252.0.0", "255.254.0.0"),
+            route("176.59.0.0", "255.255.0.0"),
+            route("178.64.0.0", "255.192.0.0"),
+            route("188.16.0.0", "255.240.0.0"),
+            route("193.0.0.0", "255.0.0.0"),
+            route("212.1.0.0", "255.255.0.0"),
+            route("217.66.0.0", "255.254.0.0")
+        ]
+    }
+
+    private func blockedRoutes() -> [NEIPv4Route] {
+        // Placeholder for blocked routes
+        ruRoutes()
+    }
+
+    private func bypassLocalRoutes() -> [NEIPv4Route] {
         [
             route("10.0.0.0", "255.0.0.0"),
             route("100.64.0.0", "255.192.0.0"),
@@ -220,39 +272,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return 30_000
     }
 
-    private func configureTransportOptions(transport: String, payload: [String: String]) {
-        #if canImport(Mobile)
+    #if canImport(Mobile)
+    private func configureTransportOptions(_ rt: MobileRuntime, transport: String, payload: [String: String]) {
         switch transport.lowercased() {
         case "vp8channel":
-            MobileSetVP8Options(
-                payloadInt(payload, "vp8-fps", default: 60),
-                payloadInt(payload, "vp8-batch", default: 64)
+            try? rt.setVP8Options(
+                Int32(payloadInt(payload, "vp8-fps", default: 60)),
+                Int32(payloadInt(payload, "vp8-batch", default: 64))
             )
         case "seichannel":
-            MobileSetSEIOptions(
-                payloadInt(payload, "fps", default: 0),
-                payloadInt(payload, "batch", default: 0),
-                payloadInt(payload, "frag", default: 0),
-                payloadInt(payload, "ack-ms", default: 0)
+            try? rt.setSEIOptions(
+                Int32(payloadInt(payload, "fps", default: 30)),
+                Int32(payloadInt(payload, "batch", default: 64)),
+                Int32(payloadInt(payload, "frag", default: 900)),
+                Int32(payloadInt(payload, "ack-ms", default: 2000))
             )
         case "videochannel":
-            MobileSetVideoOptions(
-                payloadInt(payload, "video-w", default: 0),
-                payloadInt(payload, "video-h", default: 0),
-                payloadInt(payload, "video-fps", default: 0),
-                payload["video-bitrate"] ?? "",
-                payload["video-hw"] ?? "",
-                payloadInt(payload, "video-qr-size", default: 0),
-                payload["video-qr-recovery"] ?? "",
-                payload["video-codec"] ?? "",
-                payloadInt(payload, "video-tile-module", default: 0),
-                payloadInt(payload, "video-tile-rs", default: 0)
+            try? rt.setVideoOptions(
+                Int32(payloadInt(payload, "video-w", default: 1920)),
+                Int32(payloadInt(payload, "video-h", default: 1080)),
+                Int32(payloadInt(payload, "video-fps", default: 30)),
+                Int32(payloadInt(payload, "video-qr-size", default: 0)),
+                payload["video-qr-recovery"] ?? "low",
+                payload["video-codec"] ?? "qrcode",
+                Int32(payloadInt(payload, "video-tile-module", default: 4)),
+                Int32(payloadInt(payload, "video-tile-rs", default: 0))
             )
         default:
             break
         }
-        #endif
     }
+    #endif
 
     private func payloadInt(_ payload: [String: String], _ key: String, default defaultValue: Int) -> Int {
         Int(payload[key] ?? "") ?? defaultValue
@@ -330,7 +380,7 @@ private enum TunnelError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidConfiguration:
-            return "OlcRTC VPN configuration is incomplete."
+            return "VPN configuration is incomplete."
         case .providerDeallocated:
             return "OlcRTC VPN provider was deallocated."
         case .mobileFrameworkMissing:
